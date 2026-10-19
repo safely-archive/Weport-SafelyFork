@@ -76,6 +76,7 @@ import { weCloneService } from './services/weCloneService'
 import { TASK_KEY, taskStatusService } from './services/taskStatusService'
 import { AnnotationsService } from './services/annotationsService'
 import { SearchIndexService, createExportContextDecoder } from './services/searchIndexService'
+import { runWithAbortSignal } from './services/ai/abortRun'
 import { connectorsService } from './services/connectors/connectorsService'
 import { registerCliCommands } from './services/cliCommands'
 import { runCommand } from './services/weportCommands'
@@ -886,6 +887,12 @@ async function withWriteSnapshotBody<T>(reason: string, run: () => Promise<T>): 
       if (configService?.getAccountDir() !== accountDir) return { success: false, error: '当前账号已改变，已中止数据库写入' }
       if ((await observer.observePlatform()).wechatPids.length) return { success: false, error: '微信已启动，已中止数据库写入' }
     } finally { releaseCapture() }
+    // Snapshot capture closes the host. Reconnect before dispatching wrappers
+    // such as SNS trigger operations, which require an already-open handle.
+    const connection = await chatService.connect()
+    if (!connection.success) return { success: false, error: connection.error || '快照完成后重新连接数据库失败' }
+    if (configService?.getAccountDir() !== accountDir) return { success: false, error: '当前账号已改变，已中止数据库写入' }
+    if ((await observer.observePlatform()).wechatPids.length) return { success: false, error: '微信已启动，已中止数据库写入' }
     taskStatusService.progress(TASK_KEY.databaseMaintenance, { stage: '执行写入', message: '快照完成，正在修改数据库' })
     return await run()
   } catch (e) {
@@ -2188,7 +2195,7 @@ let weBotSchedulerStarted = false
 async function dispatchWeBotTask(request: WeBotDispatchRequest, signal: AbortSignal): Promise<WeBotDispatchResult> {
   if (signal.aborted) throw new Error('已中止')
 
-  const chat = weportAiService.createChat(request.task.title)
+  const chat = weportAiService.createChat(request.task.title, { kind: 'automation', taskId: request.task.id })
   const sections: string[] = []
   if (request.task.description.trim()) sections.push(request.task.description.trim())
 
@@ -2211,7 +2218,9 @@ async function dispatchWeBotTask(request: WeBotDispatchRequest, signal: AbortSig
 
   // WeBot 在「设置 → AI 服务」里有自己的服务指向（默认跟随默认服务），因此定时
   // 任务可以独立指向一个便宜/快的模型，而不影响 WeportAI 的手动对话。
-  const result = await weportAiService.runChat(chat.id, sections.join('\n\n'), { consumer: 'webot' })
+  const result = await runWithAbortSignal(signal,
+    () => weportAiService.runChat(chat.id, sections.join('\n\n'), { consumer: 'webot' }),
+    () => weportAiService.abort(chat.id))
   if (!result.success) throw new Error(result.error || '任务执行失败')
 
   const finished = weportAiService.getChat(chat.id)
